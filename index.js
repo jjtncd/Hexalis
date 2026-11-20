@@ -362,10 +362,13 @@ function handleMapChunkBulk(session, packet) {
 }
 
 function markSessionJoined(session, source) {
-    if (session.joined) return;
+    const wasJoined = session.joined === true;
+    // Keep the state monotonic: later login/position packets must not demote a
+    // session after playerJoin has already confirmed world entry.
     session.joined = true;
     session.verificationRequired = false;
     session.state = "joined";
+    if (wasJoined) return;
     pushBridgeEvent(session, { type: "player_join", username: session.username });
     console.log(`[BRIDGE] LOGIN OK (${source}): ${session.username} @ ${session.host}`);
 }
@@ -380,7 +383,9 @@ function onMinecraftPacket(session, packet, meta) {
         case "login": {
             session.loginPacketSeen = true;
             session.verificationRequired = false;
-            session.state = "login_accepted";
+            // playerJoin can fire before this packet callback. Never overwrite
+            // the confirmed joined state with the earlier login_accepted state.
+            session.state = session.joined ? "joined" : "login_accepted";
             session.dimension = Number(packet.dimension) || 0;
             session.gameMode = Number(packet.gameMode) || 0;
             pushBridgeEvent(session, {
@@ -712,7 +717,7 @@ app.post("/bridge/send", (req, res) => {
     if (!session || session.closed || !session.client) {
         return res.status(404).json({ ok: false, error: "Sesión no activa" });
     }
-    if (session.state !== "joined") {
+    if (!session.joined) {
         return res.status(409).json({ ok: false, error: "Todavía no has entrado al mundo" });
     }
 
@@ -802,7 +807,7 @@ app.post("/bridge/chat", (req, res) => {
     if (!session || session.closed || !session.client) {
         return res.status(404).json({ ok: false, error: "Sesión no activa" });
     }
-    if (session.state !== "joined") {
+    if (!session.joined) {
         return res.status(409).json({ ok: false, error: "Todavía no has entrado al mundo" });
     }
     const text = String(req.body?.text || "").trim();
