@@ -528,12 +528,41 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "update_health":
-            pushEvent(session, { type: "health",
-                health:     Number(packet.health)        || 0,
-                food:       Number(packet.food)          || 0,
-                saturation: Number(packet.foodSaturation) || 0 });
+        case "update_health": {
+            const hpRaw = packet.health ?? packet.hp ?? packet.healthValue;
+            const foodRaw = packet.food ?? packet.foodLevel ?? packet.foods;
+            const satRaw = packet.foodSaturation ?? packet.saturation ?? packet.foodSaturationLevel;
+            const hp = Number(hpRaw);
+            const food = Number(foodRaw);
+            const sat = Number(satRaw);
+            const health = Number.isFinite(hp) ? hp : 20;
+            const foodVal = Number.isFinite(food) ? food : 0;
+            const satVal = Number.isFinite(sat) ? sat : 0;
+            const wasDead = session.dead === true;
+            session.dead = health <= 0;
+            session.lastHealth = health;
+            session.lastFood = foodVal;
+            // Always push health; death is critical and must not be coalesced away
+            pushEvent(session, {
+                type: "health",
+                health,
+                food: foodVal,
+                saturation: satVal,
+                dead: health <= 0,
+            });
+            if (session.dead && !wasDead) {
+                console.log(`[HEALTH] DEATH ${session.username} hp=${health}`);
+                pushEvent(session, {
+                    type: "death",
+                    health: 0,
+                    food: foodVal,
+                    saturation: satVal,
+                });
+            } else if (!session.dead && wasDead) {
+                console.log(`[HEALTH] ALIVE ${session.username} hp=${health}`);
+            }
             break;
+        }
 
         case "respawn":
             session.dimension = Number(packet.dimension) || 0;
@@ -548,33 +577,22 @@ function onPacket(session, packet, meta) {
 
         // ── ENTITIES ──────────────────────────────────────────────────────────
 
-        case "named_entity_spawn":
-        case "spawn_entity_living": // some protocol maps
-        {
-            // 1.8.8 other players
+        case "named_entity_spawn": {
             if (session.entities.size >= MAX_ENTITIES) break;
-            const eid  = Number(packet.entityId ?? packet.entity_id);
-            if (!Number.isFinite(eid)) break;
+            const eid  = Number(packet.entityId);
             const ex   = fixedToFloat(packet.x);
             const ey   = fixedToFloat(packet.y);
             const ez   = fixedToFloat(packet.z);
             const eyaw = angleToYaw(packet.yaw);
-            const ename = String(
-                packet.playerName || packet.name || packet.username || "Player"
-            ).slice(0, 32);
-            // spawn_entity_living with type is a mob — skip player path if type present and not player
-            if (meta.name === "spawn_entity_living" && packet.type != null && Number(packet.type) !== 0) {
-                // fall through handled below via separate case? treat as mob here
-            }
+            const ename = String(packet.playerName || packet.name || "Player").slice(0, 32);
             session.entities.set(eid, { x: ex, y: ey, z: ez, yaw: eyaw, kind: "player", name: ename });
             pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "player", name: ename, x: ex, y: ey, z: ez, yaw: eyaw });
-            console.log(`[ENTITY] player spawn ${ename} #${eid} @ ${ex.toFixed(1)},${ey.toFixed(1)},${ez.toFixed(1)}`);
             break;
         }
 
         case "spawn_mob": {
             if (session.entities.size >= MAX_ENTITIES) break;
-            const eid     = Number(packet.entityId ?? packet.entity_id);
+            const eid     = Number(packet.entityId);
             const ex      = fixedToFloat(packet.x);
             const ey      = fixedToFloat(packet.y);
             const ez      = fixedToFloat(packet.z);
@@ -586,23 +604,19 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "rel_entity_move":
-        case "entity_rel_move": {
-            const eid = Number(packet.entityId ?? packet.entity_id);
+        case "rel_entity_move": {
+            const eid = Number(packet.entityId);
             const e   = session.entities.get(eid);
             if (!e) break;
-            const dx = packet.dX ?? packet.dx ?? packet.x ?? 0;
-            const dy = packet.dY ?? packet.dy ?? packet.y ?? 0;
-            const dz = packet.dZ ?? packet.dz ?? packet.z ?? 0;
-            e.x += fixedToFloat(dx);
-            e.y += fixedToFloat(dy);
-            e.z += fixedToFloat(dz);
+            e.x += fixedToFloat(packet.dX);
+            e.y += fixedToFloat(packet.dY);
+            e.z += fixedToFloat(packet.dZ);
             pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
             break;
         }
 
         case "entity_look": {
-            const eid = Number(packet.entityId ?? packet.entity_id);
+            const eid = Number(packet.entityId);
             const e   = session.entities.get(eid);
             if (!e) break;
             e.yaw = angleToYaw(packet.yaw);
@@ -610,37 +624,22 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "entity_move_look":
-        case "entity_rel_move_look": {
-            const eid = Number(packet.entityId ?? packet.entity_id);
+        case "entity_move_look": {
+            const eid = Number(packet.entityId);
             const e   = session.entities.get(eid);
             if (!e) break;
-            const dx = packet.dX ?? packet.dx ?? 0;
-            const dy = packet.dY ?? packet.dy ?? 0;
-            const dz = packet.dZ ?? packet.dz ?? 0;
-            e.x  += fixedToFloat(dx);
-            e.y  += fixedToFloat(dy);
-            e.z  += fixedToFloat(dz);
+            e.x  += fixedToFloat(packet.dX);
+            e.y  += fixedToFloat(packet.dY);
+            e.z  += fixedToFloat(packet.dZ);
             e.yaw = angleToYaw(packet.yaw);
             pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
             break;
         }
 
         case "entity_teleport": {
-            const eid = Number(packet.entityId ?? packet.entity_id);
+            const eid = Number(packet.entityId);
             const e   = session.entities.get(eid);
-            if (!e) {
-                // Create stub so later moves work if spawn was missed
-                if (session.entities.size < MAX_ENTITIES) {
-                    const x = fixedToFloat(packet.x);
-                    const y = fixedToFloat(packet.y);
-                    const z = fixedToFloat(packet.z);
-                    const yaw = angleToYaw(packet.yaw);
-                    session.entities.set(eid, { x, y, z, yaw, kind: "player", name: "Player" });
-                    pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "player", name: "Player", x, y, z, yaw });
-                }
-                break;
-            }
+            if (!e) break;
             e.x   = fixedToFloat(packet.x);
             e.y   = fixedToFloat(packet.y);
             e.z   = fixedToFloat(packet.z);
@@ -649,10 +648,8 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "entity_destroy":
-        case "destroy_entities": {
-            const raw = packet.entityIds || packet.entityids || packet.ids || [];
-            const ids = Array.isArray(raw) ? raw.map(Number) : [];
+        case "entity_destroy": {
+            const ids = Array.isArray(packet.entityIds) ? packet.entityIds.map(Number) : [];
             if (!ids.length) break;
             for (const eid of ids) session.entities.delete(eid);
             pushEvent(session, { type: "entity_destroy", entityIds: ids });
@@ -744,6 +741,9 @@ app.post("/bridge/connect", async (req, res) => {
         playerX: 0, playerY: 64, playerZ: 0,
         loginPacketSeen: false,
         joined: false,
+        dead: false,
+        lastHealth: 20,
+        lastFood: 20,
         verificationRequired: false, verificationSource: null,
         closed: false,
         createdAt: Date.now(), lastActivity: Date.now(),
@@ -833,12 +833,23 @@ app.post("/bridge/poll", async (req, res) => {
         if (ev.type === "entity_move") latestMove.set(ev.entityId, ev);
     }
 
-    const events = [];
+    // Pull critical events first so death/health never starve behind chunks
+    const critical = [];
+    const rest = [];
+    for (const ev of session.queue) {
+        if (ev && (ev.type === "health" || ev.type === "death" || ev.type === "respawn" || ev.type === "disconnect" || ev.type === "end")) {
+            critical.push(ev);
+        } else {
+            rest.push(ev);
+        }
+    }
+    session.queue = rest;
+
+    const events = [...critical];
     let chunksInResponse = 0;
-    while (session.queue.length && events.length < 30) {
+    while (session.queue.length && events.length < 40) {
         const next = session.queue[0];
         if (next.type === "chunk_data" && chunksInResponse >= 6) break;
-        // skip stale entity_move events (not the latest for this entityId)
         if (next.type === "entity_move" && latestMove.get(next.entityId) !== next) {
             session.queue.shift();
             continue;
