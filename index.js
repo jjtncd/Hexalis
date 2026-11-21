@@ -34,7 +34,7 @@ function chatPacketToText(packet) {
 }
 
 async function pingServer(host, port) {
-    return mc.ping({ host, port, version: false, closeTimeout: 5000 });
+    return mc.ping({ host, port, version: "1.8.8", closeTimeout: 15000, noPongTimeout: 5000 });
 }
 
 function faviconToHex(favicon, size = 32) {
