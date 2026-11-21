@@ -105,6 +105,9 @@ async function resolveSrvTargets(host, port) {
 
     const isHostname = net.isIP(host) === 0;
 
+    // Prefer exact host:port first (Aternos / custom ports work more reliably this way)
+    add(host, port, "direct");
+
     if (isHostname) {
         const srvNames = [`_minecraft._tcp.${host}`, `_minecraft._tcp.${host.replace(/\.$/, "")}`];
         for (const srvName of srvNames) {
@@ -119,7 +122,6 @@ async function resolveSrvTargets(host, port) {
                     const dnsErr = await publicDnsError(target);
                     if (!dnsErr) add(target, targetPort, "srv");
                 }
-                if (candidates.length) break;
             } catch (e) {
                 if (!["ENODATA", "ENOTFOUND", "ESERVFAIL", "EREFUSED"].includes(e?.code)) {
                     console.warn(`[SRV] ${host}: ${e?.code || e?.message}`);
@@ -128,9 +130,7 @@ async function resolveSrvTargets(host, port) {
         }
     }
 
-    add(host, port, "direct");
-
-    if (isHostname && port !== 25565 && candidates.length < 3) {
+    if (isHostname && port !== 25565) {
         add(host, 25565, "direct-25565");
     }
 
@@ -706,7 +706,7 @@ app.post("/bridge/connect", async (req, res) => {
         queue: [], waiters: new Set(),
         packetCounts: {}, packetsSeen: 0, mapChunks: 0,
         chunkKeys: new Set(),
-        entities: new Map(),           // ← entity tracking
+        entities: new Map(),
         dimension: 0, gameMode: 0,
         positionSeen: false,
         playerX: 0, playerY: 64, playerZ: 0,
@@ -722,8 +722,31 @@ app.post("/bridge/connect", async (req, res) => {
 
     try {
         const candidates = await resolveSrvTargets(host, port);
-        const target = candidates[0];
+        // Prefer direct requested port first for Aternos-style hosts, then SRV, then 25565
+        const ordered = [];
+        const seen = new Set();
+        const push = (c) => {
+            const key = `${c.host.toLowerCase()}:${c.port}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            ordered.push(c);
+        };
+        for (const c of candidates) {
+            if (c.route === "direct") push(c);
+        }
+        for (const c of candidates) {
+            if (c.route === "srv") push(c);
+        }
+        for (const c of candidates) {
+            if (c.route !== "direct" && c.route !== "srv") push(c);
+        }
+        if (!ordered.length) {
+            session.closed = true;
+            sessions.delete(sessionId);
+            return res.status(502).json({ ok: false, error: "No se pudo resolver el host del servidor" });
+        }
 
+        const target = ordered[0];
         console.log(`[BRIDGE] ${username} -> ${target.host}:${target.port} via ${target.route} (1.8.8 offline)`);
 
         const client = mc.createClient({
@@ -735,6 +758,9 @@ app.post("/bridge/connect", async (req, res) => {
             hideErrors: true,
         });
         session.client = client;
+
+        // Keep alternate targets for a quick retry if the first socket dies before login
+        session._altTargets = ordered.slice(1, 4);
 
         client.on("connect", () => {
             session.state = "tcp_connected";
@@ -768,15 +794,21 @@ app.post("/bridge/connect", async (req, res) => {
             if (isVerificationNotice(r)) markVerificationRequired(session, "end_reason");
             if (!session.closed && session.state !== "error") {
                 session.state = "disconnected";
-                session.error = session.verificationRequired
-                    ? "El servidor cerró la conexión después de solicitar verificación."
-                    : (r || "El servidor cerró la conexión");
+                if (session.verificationRequired) {
+                    session.error = "El servidor cerró la conexión después de solicitar verificación.";
+                } else if (!session.loginPacketSeen && !session.joined) {
+                    session.error = r || "El servidor cerró antes del login (offline-mode/version/firewall).";
+                } else {
+                    session.error = r || "El servidor cerró la conexión";
+                }
             }
+            pushEvent(session, { type: "disconnect", reason: session.error || r });
             pushEvent(session, { type: "end", reason: session.error || r });
             if (session._keepAlive) { clearInterval(session._keepAlive); session._keepAlive = null; }
             console.log(`[BRIDGE] End: ${username} @ ${target.host}`);
         });
 
+        // Original behavior: return session immediately (async TCP/login via poll)
         return res.json({ ok: true, sessionId, username, version: "1.8.8", auth: "offline",
             resolvedHost: target.host, resolvedPort: target.port, route: target.route });
     } catch (error) {
@@ -786,199 +818,4 @@ app.post("/bridge/connect", async (req, res) => {
     }
 });
 
-// poll — deduplicates entity_move per entityId before sending
-app.post("/bridge/poll", async (req, res) => {
-    if (!requireBridgeKey(req, res)) return;
-    const session = getSession(req.body?.sessionId);
-    if (!session) return res.status(404).json({ ok: false, error: "Sesión no encontrada" });
-    session.lastActivity = Date.now();
-    const waitMs = Math.max(0, Math.min(1500, Number(req.body?.waitMs) || 0));
-    await waitForEvents(session, waitMs);
-
-    // Deduplicate entity_move: for the same entityId keep only the latest
-    const latestMove = new Map();
-    for (const ev of session.queue) {
-        if (ev.type === "entity_move") latestMove.set(ev.entityId, ev);
-    }
-
-    const events = [];
-    let chunksInResponse = 0;
-    while (session.queue.length && events.length < 30) {
-        const next = session.queue[0];
-        if (next.type === "chunk_data" && chunksInResponse >= 6) break;
-        // skip stale entity_move events (not the latest for this entityId)
-        if (next.type === "entity_move" && latestMove.get(next.entityId) !== next) {
-            session.queue.shift();
-            continue;
-        }
-        events.push(session.queue.shift());
-        if (next.type === "chunk_data") chunksInResponse++;
-    }
-
-    return res.json({
-        ok: true, state: session.state,
-        joined: session.joined,
-        verificationRequired: session.verificationRequired === true,
-        error: session.error,
-        username: session.username,
-        version: "1.8.8",
-        packetsSeen: session.packetsSeen,
-        mapChunks: session.mapChunks,
-        protocolState: session.protocolState || "",
-        packetCounts: session.packetCounts,
-        events
-    });
-});
-
-function finiteNumber(v) { return typeof v === "number" && Number.isFinite(v); }
-function validPos(p) {
-    return finiteNumber(p.x) && finiteNumber(p.y) && finiteNumber(p.z) &&
-        Math.abs(p.x) <= 30_000_000 && Math.abs(p.z) <= 30_000_000 &&
-        p.y >= -2048 && p.y <= 4096;
-}
-function validRot(p) {
-    return finiteNumber(p.yaw) && finiteNumber(p.pitch) &&
-        Math.abs(p.yaw) <= 360_000 && p.pitch >= -90 && p.pitch <= 90;
-}
-
-app.post("/bridge/send", (req, res) => {
-    if (!requireBridgeKey(req, res)) return;
-    const session = getSession(req.body?.sessionId);
-    if (!session || session.closed || !session.client)
-        return res.status(404).json({ ok: false, error: "Sesión no activa" });
-    if (!session.joined)
-        return res.status(409).json({ ok: false, error: "Todavía no entraste al mundo" });
-
-    const action  = String(req.body?.action || "");
-    const payload = req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : req.body;
-    const now     = Date.now();
-    const minGap  = action === "chat" ? 500 : 25;
-    const prev    = action === "chat" ? session.lastChatAt : session.lastSendAt;
-    if (now - prev < minGap)
-        return res.status(429).json({ ok: false, throttled: true, error: "Acciones muy rápidas" });
-
-    try {
-        switch (action) {
-            case "chat": {
-                const text = String(payload.text || "").trim();
-                if (!text || text.length > 200)
-                    return res.status(400).json({ ok: false, error: "Mensaje: 1-200 caracteres" });
-                session.client.chat(text);
-                session.lastChatAt = now;
-                break;
-            }
-            case "position": {
-                if (!validPos(payload))
-                    return res.status(400).json({ ok: false, error: "Coordenadas inválidas" });
-                session.client.write("position", {
-                    x: payload.x, y: payload.y, z: payload.z,
-                    onGround: payload.onGround === true
-                });
-                session.playerX = payload.x;
-                session.playerY = payload.y;
-                session.playerZ = payload.z;
-                session.lastSendAt = now;
-                break;
-            }
-            case "look": {
-                if (!validRot(payload))
-                    return res.status(400).json({ ok: false, error: "Rotación inválida" });
-                session.client.write("look", {
-                    yaw: payload.yaw, pitch: payload.pitch,
-                    onGround: payload.onGround === true
-                });
-                session.lastSendAt = now;
-                break;
-            }
-            case "position_look": {
-                if (!validPos(payload) || !validRot(payload))
-                    return res.status(400).json({ ok: false, error: "Posición o rotación inválida" });
-                session.client.write("position_look", {
-                    x: payload.x, y: payload.y, z: payload.z,
-                    yaw: payload.yaw, pitch: payload.pitch,
-                    onGround: payload.onGround === true
-                });
-                session.playerX = payload.x;
-                session.playerY = payload.y;
-                session.playerZ = payload.z;
-                session.lastSendAt = now;
-                break;
-            }
-            case "ground":
-                session.client.write("flying", { onGround: payload.onGround === true });
-                session.lastSendAt = now;
-                break;
-            case "swing":
-                session.client.write("arm_animation", {});
-                session.lastSendAt = now;
-                break;
-            case "respawn":
-                // 1.8.8 client_command payload 0 = "perform respawn"
-                session.client.write("client_command", { payload: 0 });
-                session.lastSendAt = now;
-                break;
-            default:
-                return res.status(400).json({ ok: false, error: "Acción no permitida" });
-        }
-        session.lastActivity = now;
-        session.sendCount++;
-        return res.json({ ok: true, action, sendCount: session.sendCount });
-    } catch (error) {
-        const message = String(error?.message || error).slice(0, 300);
-        session.error = message;
-        return res.status(502).json({ ok: false, error: message });
-    }
-});
-
-app.post("/bridge/chat", (req, res) => {
-    if (!requireBridgeKey(req, res)) return;
-    const session = getSession(req.body?.sessionId);
-    if (!session || session.closed || !session.client)
-        return res.status(404).json({ ok: false, error: "Sesión no activa" });
-    if (!session.joined)
-        return res.status(409).json({ ok: false, error: "Todavía no entraste al mundo" });
-    const text = String(req.body?.text || "").trim();
-    if (!text || text.length > 200)
-        return res.status(400).json({ ok: false, error: "Mensaje: 1-200 caracteres" });
-    const now = Date.now();
-    if (now - session.lastChatAt < 500)
-        return res.status(429).json({ ok: false, throttled: true, error: "Mensajes muy rápidos" });
-    try {
-        session.client.chat(text);
-        session.lastChatAt = now; session.lastActivity = now; session.sendCount++;
-        return res.json({ ok: true, action: "chat", sendCount: session.sendCount });
-    } catch (error) {
-        return res.status(502).json({ ok: false, error: String(error?.message || error).slice(0, 300) });
-    }
-});
-
-app.post("/bridge/disconnect", (req, res) => {
-    if (!requireBridgeKey(req, res)) return;
-    const session = getSession(req.body?.sessionId);
-    if (!session) return res.json({ ok: true, alreadyClosed: true });
-    session.closed = true;
-    session.state  = "disconnected";
-    if (session._keepAlive) { clearInterval(session._keepAlive); session._keepAlive = null; }
-    try { session.client?.end("JTN MC disconnect"); } catch {}
-    pushEvent(session, { type: "closed_by_client" });
-    sessions.delete(session.id);
-    return res.json({ ok: true });
-});
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, session] of sessions) {
-        if (now - session.lastActivity > IDLE_TTL_MS || now - session.createdAt > MAX_AGE_MS) {
-            session.closed = true;
-            if (session._keepAlive) { clearInterval(session._keepAlive); session._keepAlive = null; }
-            try { session.client?.end("JTN bridge expired"); } catch {}
-            for (const wake of [...session.waiters]) wake();
-            sessions.delete(id);
-            console.log(`[BRIDGE] Expired: ${session.username} @ ${session.host}`);
-        }
-    }
-}, 60_000).unref();
-
-app.get("/health", (_req, res) => res.json({ ok: true, service: "JTN Minecraft Relay", bridgeVersion: 3 }));
-
-app.listen(PORT, "0.0.0.0", () => console.log("JTN RELAY v3 + BRIDGE (entities+chat) — PORT:", PORT));
+a
