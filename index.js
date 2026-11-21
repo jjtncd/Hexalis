@@ -93,7 +93,7 @@ function statusError(error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MEJORA 1: SRV lookup más robusto — prueba SRV, directo, y puerto 25565
+// SRV lookup
 // ─────────────────────────────────────────────────────────────────────────────
 async function resolveSrvTargets(host, port) {
     const candidates = [];
@@ -105,7 +105,6 @@ async function resolveSrvTargets(host, port) {
 
     const isHostname = net.isIP(host) === 0;
 
-    // Siempre intentar SRV si es hostname (no solo cuando port===25565)
     if (isHostname) {
         const srvNames = [`_minecraft._tcp.${host}`, `_minecraft._tcp.${host.replace(/\.$/, "")}`];
         for (const srvName of srvNames) {
@@ -129,10 +128,8 @@ async function resolveSrvTargets(host, port) {
         }
     }
 
-    // Siempre agregar directo como fallback
     add(host, port, "direct");
 
-    // Si el port no es 25565 y es hostname, también intentar con 25565 como último recurso
     if (isHostname && port !== 25565 && candidates.length < 3) {
         add(host, 25565, "direct-25565");
     }
@@ -150,7 +147,7 @@ async function pingServer(host, port) {
                 host: candidate.host,
                 port: candidate.port,
                 version: "1.8.8",
-                closeTimeout: 10000,  // más tiempo — algunos servers tardan
+                closeTimeout: 10000,
                 noPongTimeout: 4000,
             });
             result.jtnRoute  = candidate.route;
@@ -215,7 +212,7 @@ function requireBridgeKey(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Endpoints de ping/logo (sin cambios)
+// Ping / logo endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/ping", async (req, res) => {
     const host = String(req.query.host || "").trim();
@@ -270,17 +267,36 @@ app.get("/logo", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BRIDGE — sesiones
+// Entity helpers
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_ENTITIES = 150;
+
+// 1.8.8 fixed-point: absolute coords are int32 / 32
+function fixedToFloat(v) { return Number(v) / 32; }
+// angle byte: 0-255 → 0-360
+function angleToYaw(v) { return (Number(v) / 256) * 360; }
+
+const MOB_NAMES = {
+    50: "Creeper", 51: "Skeleton", 52: "Spider", 54: "Zombie",
+    55: "Slime", 56: "Ghast", 57: "ZombiePigman", 58: "Enderman",
+    59: "CaveSpider", 60: "Silverfish", 61: "Blaze", 62: "MagmaCube",
+    65: "Bat", 66: "Witch", 67: "Endermite", 68: "Guardian",
+    69: "ElderGuardian",
+    90: "Pig", 91: "Sheep", 92: "Cow", 93: "Chicken", 94: "Squid",
+    95: "Wolf", 96: "Mooshroom", 97: "SnowGolem", 98: "Ocelot",
+    99: "IronGolem", 100: "Horse", 101: "Rabbit", 120: "Villager",
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BRIDGE — sessions
 // ─────────────────────────────────────────────────────────────────────────────
 const sessions          = new Map();
-const MAX_ACTIVE        = 8;         // más sesiones simultáneas
-const MAX_QUEUE         = 256;       // más eventos en cola
+const MAX_ACTIVE        = 8;
+const MAX_QUEUE         = 256;
 const IDLE_TTL_MS       = 5 * 60 * 1000;
 const MAX_AGE_MS        = 60 * 60 * 1000;
-
-// MEJORA 3: límite de chunks aumentado
-const MAX_CHUNKS_TOTAL  = 225;  // 15x15 view distance
-const MAX_CHUNKS_RADIUS = 7;    // radio en chunks desde el player
+const MAX_CHUNKS_TOTAL  = 225;
+const MAX_CHUNKS_RADIUS = 7;
 
 function pushEvent(session, event) {
     if (!session || session.closed) return;
@@ -320,9 +336,6 @@ function popcount16(v) {
     return c;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MEJORA 3: chunks — radio aumentado y límite total mayor
-// ─────────────────────────────────────────────────────────────────────────────
 function makeChunkPayload(session, x, z, bitMap, chunkData, groundUp, skyLightSent) {
     const cx   = Number(x);
     const cz   = Number(z);
@@ -330,16 +343,15 @@ function makeChunkPayload(session, x, z, bitMap, chunkData, groundUp, skyLightSe
     if (!Number.isInteger(cx) || !Number.isInteger(cz)) throw new Error("Coordenadas inválidas");
     if (!Buffer.isBuffer(chunkData)) chunkData = Buffer.from(chunkData || []);
 
-    const sectionCount   = popcount16(mask);
-    const blockBytes     = sectionCount * 8192;
+    const sectionCount    = popcount16(mask);
+    const blockBytes      = sectionCount * 8192;
     const blockLightBytes = sectionCount * 2048;
-    const skyLightBytes  = skyLightSent ? sectionCount * 2048 : 0;
-    const biomeOffset    = blockBytes + blockLightBytes + skyLightBytes;
-    const required       = biomeOffset + (groundUp ? 256 : 0);
+    const skyLightBytes   = skyLightSent ? sectionCount * 2048 : 0;
+    const biomeOffset     = blockBytes + blockLightBytes + skyLightBytes;
+    const required        = biomeOffset + (groundUp ? 256 : 0);
     if (chunkData.length < required)
         throw new Error(`Chunk truncado: ${chunkData.length} < ${required}`);
 
-    // Radio aumentado — una vez recibida la posición del player
     if (session.positionSeen) {
         const pcx = Math.floor(session.playerX / 16);
         const pcz = Math.floor(session.playerZ / 16);
@@ -361,9 +373,9 @@ function makeChunkPayload(session, x, z, bitMap, chunkData, groundUp, skyLightSe
         const slStart = blockBytes + blockLightBytes + ordinal * 2048;
         sections.push({
             y: sy,
-            blocksBase64:    chunkData.subarray(bStart,  bStart  + 8192).toString("base64"),
+            blocksBase64:     chunkData.subarray(bStart,  bStart  + 8192).toString("base64"),
             blockLightBase64: chunkData.subarray(blStart, blStart + 2048).toString("base64"),
-            skyLightBase64:  skyLightSent ? chunkData.subarray(slStart, slStart + 2048).toString("base64") : null
+            skyLightBase64:   skyLightSent ? chunkData.subarray(slStart, slStart + 2048).toString("base64") : null
         });
         ordinal++;
     }
@@ -455,7 +467,6 @@ function onPacket(session, packet, meta) {
             session.positionSeen = true;
             if (session.loginPacketSeen) markSessionJoined(session, "initial position");
 
-            // MEJORA 2: confirmar posición inmediatamente al servidor (protocolo 1.8.8)
             if (session.client && !session.closed) {
                 try {
                     session.client.write("position_look", {
@@ -463,7 +474,7 @@ function onPacket(session, packet, meta) {
                         yaw: pos.yaw, pitch: pos.pitch,
                         onGround: true
                     });
-                } catch (e) { /* ignorar si no conectado */ }
+                } catch (e) { /* ignorar */ }
             }
 
             pushEvent(session, { type: "position", ...pos });
@@ -529,10 +540,92 @@ function onPacket(session, packet, meta) {
             session.gameMode  = Number(packet.gamemode)  || 0;
             session.positionSeen = false;
             session.chunkKeys.clear();
+            session.entities.clear();
             pushEvent(session, { type: "respawn",
                 dimension: session.dimension, gameMode: session.gameMode,
                 levelType: String(packet.levelType || "") });
             break;
+
+        // ── ENTITIES ──────────────────────────────────────────────────────────
+
+        case "named_entity_spawn": {
+            if (session.entities.size >= MAX_ENTITIES) break;
+            const eid  = Number(packet.entityId);
+            const ex   = fixedToFloat(packet.x);
+            const ey   = fixedToFloat(packet.y);
+            const ez   = fixedToFloat(packet.z);
+            const eyaw = angleToYaw(packet.yaw);
+            const ename = String(packet.playerName || packet.name || "Player").slice(0, 32);
+            session.entities.set(eid, { x: ex, y: ey, z: ez, yaw: eyaw, kind: "player", name: ename });
+            pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "player", name: ename, x: ex, y: ey, z: ez, yaw: eyaw });
+            break;
+        }
+
+        case "spawn_mob": {
+            if (session.entities.size >= MAX_ENTITIES) break;
+            const eid     = Number(packet.entityId);
+            const ex      = fixedToFloat(packet.x);
+            const ey      = fixedToFloat(packet.y);
+            const ez      = fixedToFloat(packet.z);
+            const eyaw    = angleToYaw(packet.yaw);
+            const mobType = Number(packet.type) || 0;
+            const mobName = MOB_NAMES[mobType] || `Mob${mobType}`;
+            session.entities.set(eid, { x: ex, y: ey, z: ez, yaw: eyaw, kind: "mob", mobType, name: mobName });
+            pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "mob", mobType, name: mobName, x: ex, y: ey, z: ez, yaw: eyaw });
+            break;
+        }
+
+        case "rel_entity_move": {
+            const eid = Number(packet.entityId);
+            const e   = session.entities.get(eid);
+            if (!e) break;
+            e.x += fixedToFloat(packet.dX);
+            e.y += fixedToFloat(packet.dY);
+            e.z += fixedToFloat(packet.dZ);
+            pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
+            break;
+        }
+
+        case "entity_look": {
+            const eid = Number(packet.entityId);
+            const e   = session.entities.get(eid);
+            if (!e) break;
+            e.yaw = angleToYaw(packet.yaw);
+            pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
+            break;
+        }
+
+        case "entity_move_look": {
+            const eid = Number(packet.entityId);
+            const e   = session.entities.get(eid);
+            if (!e) break;
+            e.x  += fixedToFloat(packet.dX);
+            e.y  += fixedToFloat(packet.dY);
+            e.z  += fixedToFloat(packet.dZ);
+            e.yaw = angleToYaw(packet.yaw);
+            pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
+            break;
+        }
+
+        case "entity_teleport": {
+            const eid = Number(packet.entityId);
+            const e   = session.entities.get(eid);
+            if (!e) break;
+            e.x   = fixedToFloat(packet.x);
+            e.y   = fixedToFloat(packet.y);
+            e.z   = fixedToFloat(packet.z);
+            e.yaw = angleToYaw(packet.yaw);
+            pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
+            break;
+        }
+
+        case "entity_destroy": {
+            const ids = Array.isArray(packet.entityIds) ? packet.entityIds.map(Number) : [];
+            if (!ids.length) break;
+            for (const eid of ids) session.entities.delete(eid);
+            pushEvent(session, { type: "entity_destroy", entityIds: ids });
+            break;
+        }
 
         case "kick_disconnect":
         case "login_disconnect":
@@ -569,16 +662,11 @@ function getSession(id) {
     return sessions.get(id) || null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MEJORA 2: keep-alive automático — manda position_look cada 10s si no hay
-//           movimiento desde Roblox, para que el server no kickee al player
-// ─────────────────────────────────────────────────────────────────────────────
 function startKeepAlive(session) {
     if (session._keepAlive) return;
     session._keepAlive = setInterval(() => {
         if (session.closed || !session.client || !session.joined) return;
         const now = Date.now();
-        // Si no hubo movimiento en 8 segundos, mandar posición actual
         if (now - session.lastSendAt > 8000) {
             try {
                 session.client.write("position_look", {
@@ -618,6 +706,7 @@ app.post("/bridge/connect", async (req, res) => {
         queue: [], waiters: new Set(),
         packetCounts: {}, packetsSeen: 0, mapChunks: 0,
         chunkKeys: new Set(),
+        entities: new Map(),           // ← entity tracking
         dimension: 0, gameMode: 0,
         positionSeen: false,
         playerX: 0, playerY: 64, playerZ: 0,
@@ -632,7 +721,6 @@ app.post("/bridge/connect", async (req, res) => {
     sessions.set(sessionId, session);
 
     try {
-        // MEJORA 1: resolver SRV antes de conectar para usar el target correcto
         const candidates = await resolveSrvTargets(host, port);
         const target = candidates[0];
 
@@ -698,7 +786,7 @@ app.post("/bridge/connect", async (req, res) => {
     }
 });
 
-// MEJORA 3: poll devuelve hasta 6 chunks por respuesta (antes 2)
+// poll — deduplicates entity_move per entityId before sending
 app.post("/bridge/poll", async (req, res) => {
     if (!requireBridgeKey(req, res)) return;
     const session = getSession(req.body?.sessionId);
@@ -706,14 +794,27 @@ app.post("/bridge/poll", async (req, res) => {
     session.lastActivity = Date.now();
     const waitMs = Math.max(0, Math.min(1500, Number(req.body?.waitMs) || 0));
     await waitForEvents(session, waitMs);
+
+    // Deduplicate entity_move: for the same entityId keep only the latest
+    const latestMove = new Map();
+    for (const ev of session.queue) {
+        if (ev.type === "entity_move") latestMove.set(ev.entityId, ev);
+    }
+
     const events = [];
     let chunksInResponse = 0;
-    while (session.queue.length && events.length < 20) {
+    while (session.queue.length && events.length < 30) {
         const next = session.queue[0];
         if (next.type === "chunk_data" && chunksInResponse >= 6) break;
+        // skip stale entity_move events (not the latest for this entityId)
+        if (next.type === "entity_move" && latestMove.get(next.entityId) !== next) {
+            session.queue.shift();
+            continue;
+        }
         events.push(session.queue.shift());
         if (next.type === "chunk_data") chunksInResponse++;
     }
+
     return res.json({
         ok: true, state: session.state,
         joined: session.joined,
@@ -729,7 +830,6 @@ app.post("/bridge/poll", async (req, res) => {
     });
 });
 
-// MEJORA 2: send — movimiento aplicado al servidor inmediatamente
 function finiteNumber(v) { return typeof v === "number" && Number.isFinite(v); }
 function validPos(p) {
     return finiteNumber(p.x) && finiteNumber(p.y) && finiteNumber(p.z) &&
@@ -752,7 +852,7 @@ app.post("/bridge/send", (req, res) => {
     const action  = String(req.body?.action || "");
     const payload = req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : req.body;
     const now     = Date.now();
-    const minGap  = action === "chat" ? 500 : 25;  // movimiento más rápido (25ms vs 45ms)
+    const minGap  = action === "chat" ? 500 : 25;
     const prev    = action === "chat" ? session.lastChatAt : session.lastSendAt;
     if (now - prev < minGap)
         return res.status(429).json({ ok: false, throttled: true, error: "Acciones muy rápidas" });
@@ -774,7 +874,6 @@ app.post("/bridge/send", (req, res) => {
                     x: payload.x, y: payload.y, z: payload.z,
                     onGround: payload.onGround === true
                 });
-                // Actualizar posición interna para el keep-alive
                 session.playerX = payload.x;
                 session.playerY = payload.y;
                 session.playerZ = payload.z;
@@ -861,7 +960,6 @@ app.post("/bridge/disconnect", (req, res) => {
     return res.json({ ok: true });
 });
 
-// Limpieza de sesiones expiradas
 setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
@@ -876,6 +974,6 @@ setInterval(() => {
     }
 }, 60_000).unref();
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "JTN Minecraft Relay", bridgeVersion: 2 }));
+app.get("/health", (_req, res) => res.json({ ok: true, service: "JTN Minecraft Relay", bridgeVersion: 3 }));
 
-app.listen(PORT, "0.0.0.0", () => console.log("JTN RELAY v2 + BRIDGE UP — PORT:", PORT));
+app.listen(PORT, "0.0.0.0", () => console.log("JTN RELAY v3 + BRIDGE (entities+chat) — PORT:", PORT));
