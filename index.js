@@ -214,11 +214,13 @@ function requireBridgeKey(req, res) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Ping / logo endpoints
 // ─────────────────────────────────────────────────────────────────────────────
-async function buildPingResponse(host, port) {
+app.get("/ping", async (req, res) => {
+    const host = String(req.query.host || "").trim();
+    const port = Number.parseInt(req.query.port, 10) || 25565;
     const validation = validateTarget(host, port);
-    if (validation) return { ok: false, status: "unreachable", host, port, error: validation };
+    if (validation) return res.status(400).json({ error: validation });
     const dnsError = await publicDnsError(host);
-    if (dnsError) return { ok: false, status: "unreachable", host, port, error: dnsError };
+    if (dnsError) return res.status(400).json({ error: dnsError });
     try {
         const result = await pingServer(host, port);
         let pixels = null;
@@ -226,8 +228,8 @@ async function buildPingResponse(host, port) {
             try { pixels = faviconToHex(result.favicon, 32); }
             catch (e) { console.warn("[FAVICON]", host, e.message); }
         }
-        return {
-            ok: true, status: "online", host, port,
+        res.json({
+            ok: true, status: "online",
             motd:    chatComponentToText(result.description),
             online:  result.players?.online ?? 0,
             max:     result.players?.max    ?? 0,
@@ -237,96 +239,17 @@ async function buildPingResponse(host, port) {
             latency: result.latency        ?? 0,
             route:   result.jtnRoute       || "direct",
             target:  result.jtnTarget      || `${host}:${port}`
-        };
+        });
     } catch (error) {
         const detail = statusError(error);
-        return {
-            ok: false, status: "unreachable", host, port,
+        res.status(502).json({
+            ok: false, status: "unreachable",
             error: detail.message || "No se pudo consultar el servidor",
             errorCode: detail.code,
             attempts: Array.isArray(error?.attempts) ? error.attempts : []
-        };
-    }
-}
-
-function parseServerEntry(entry) {
-    if (typeof entry === "string") {
-        const cleaned = entry.trim();
-        if (!cleaned) return null;
-        const idx = cleaned.lastIndexOf(":");
-        if (idx > 0 && /^\d+$/.test(cleaned.slice(idx + 1))) {
-            return { host: cleaned.slice(0, idx), port: Number(cleaned.slice(idx + 1)) };
-        }
-        return { host: cleaned, port: 25565 };
-    }
-    if (entry && typeof entry === "object") {
-        const host = String(entry.host || "").trim();
-        if (!host) return null;
-        return { host, port: Number.parseInt(entry.port, 10) || 25565 };
-    }
-    return null;
-}
-
-function collectServersFromRequest(req) {
-    const list = [];
-    const seen = new Set();
-    const add = (entry) => {
-        const parsed = parseServerEntry(entry);
-        if (!parsed) return;
-        const key = `${parsed.host.toLowerCase()}:${parsed.port}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        list.push(parsed);
-    };
-
-    if (req.body && typeof req.body === "object") {
-        if (Array.isArray(req.body.servers)) {
-            for (const s of req.body.servers) add(s);
-        }
-        if (req.body.host) add({ host: req.body.host, port: req.body.port });
-    }
-
-    if (typeof req.query.servers === "string" && req.query.servers.trim()) {
-        for (const part of req.query.servers.split(",")) add(part);
-    }
-    const serverQ = req.query.server;
-    if (Array.isArray(serverQ)) for (const s of serverQ) add(s);
-    else if (typeof serverQ === "string") add(serverQ);
-
-    if (typeof req.query.host === "string" && req.query.host.trim()) {
-        add({ host: req.query.host, port: req.query.port });
-    }
-
-    return list.slice(0, 25);
-}
-
-async function handlePingRequest(req, res) {
-    const list = collectServersFromRequest(req);
-    if (!list.length) {
-        return res.status(400).json({ ok: false, error: "Pasa host/port o servers[]" });
-    }
-
-    if (list.length === 1) {
-        const payload = await buildPingResponse(list[0].host, list[0].port);
-        return res.status(payload.ok ? 200 : 502).json({
-            ...payload,
-            count: 1,
-            servers: [payload],
         });
     }
-
-    const results = await Promise.all(list.map(s => buildPingResponse(s.host, s.port)));
-    return res.json({
-        ok: true,
-        count: results.length,
-        online: results.filter(r => r.ok).length,
-        servers: results,
-    });
-}
-
-// /ping unificado: 1 o muchos servers en paralelo (MOTD, players, version, latency)
-app.get("/ping", handlePingRequest);
-app.post("/ping", handlePingRequest);
+});
 
 app.get("/logo", async (req, res) => {
     const host = String(req.query.host || "mc.hypixel.net").trim();
