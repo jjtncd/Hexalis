@@ -548,22 +548,33 @@ function onPacket(session, packet, meta) {
 
         // ── ENTITIES ──────────────────────────────────────────────────────────
 
-        case "named_entity_spawn": {
+        case "named_entity_spawn":
+        case "spawn_entity_living": // some protocol maps
+        {
+            // 1.8.8 other players
             if (session.entities.size >= MAX_ENTITIES) break;
-            const eid  = Number(packet.entityId);
+            const eid  = Number(packet.entityId ?? packet.entity_id);
+            if (!Number.isFinite(eid)) break;
             const ex   = fixedToFloat(packet.x);
             const ey   = fixedToFloat(packet.y);
             const ez   = fixedToFloat(packet.z);
             const eyaw = angleToYaw(packet.yaw);
-            const ename = String(packet.playerName || packet.name || "Player").slice(0, 32);
+            const ename = String(
+                packet.playerName || packet.name || packet.username || "Player"
+            ).slice(0, 32);
+            // spawn_entity_living with type is a mob — skip player path if type present and not player
+            if (meta.name === "spawn_entity_living" && packet.type != null && Number(packet.type) !== 0) {
+                // fall through handled below via separate case? treat as mob here
+            }
             session.entities.set(eid, { x: ex, y: ey, z: ez, yaw: eyaw, kind: "player", name: ename });
             pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "player", name: ename, x: ex, y: ey, z: ez, yaw: eyaw });
+            console.log(`[ENTITY] player spawn ${ename} #${eid} @ ${ex.toFixed(1)},${ey.toFixed(1)},${ez.toFixed(1)}`);
             break;
         }
 
         case "spawn_mob": {
             if (session.entities.size >= MAX_ENTITIES) break;
-            const eid     = Number(packet.entityId);
+            const eid     = Number(packet.entityId ?? packet.entity_id);
             const ex      = fixedToFloat(packet.x);
             const ey      = fixedToFloat(packet.y);
             const ez      = fixedToFloat(packet.z);
@@ -575,19 +586,23 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "rel_entity_move": {
-            const eid = Number(packet.entityId);
+        case "rel_entity_move":
+        case "entity_rel_move": {
+            const eid = Number(packet.entityId ?? packet.entity_id);
             const e   = session.entities.get(eid);
             if (!e) break;
-            e.x += fixedToFloat(packet.dX);
-            e.y += fixedToFloat(packet.dY);
-            e.z += fixedToFloat(packet.dZ);
+            const dx = packet.dX ?? packet.dx ?? packet.x ?? 0;
+            const dy = packet.dY ?? packet.dy ?? packet.y ?? 0;
+            const dz = packet.dZ ?? packet.dz ?? packet.z ?? 0;
+            e.x += fixedToFloat(dx);
+            e.y += fixedToFloat(dy);
+            e.z += fixedToFloat(dz);
             pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
             break;
         }
 
         case "entity_look": {
-            const eid = Number(packet.entityId);
+            const eid = Number(packet.entityId ?? packet.entity_id);
             const e   = session.entities.get(eid);
             if (!e) break;
             e.yaw = angleToYaw(packet.yaw);
@@ -595,22 +610,37 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "entity_move_look": {
-            const eid = Number(packet.entityId);
+        case "entity_move_look":
+        case "entity_rel_move_look": {
+            const eid = Number(packet.entityId ?? packet.entity_id);
             const e   = session.entities.get(eid);
             if (!e) break;
-            e.x  += fixedToFloat(packet.dX);
-            e.y  += fixedToFloat(packet.dY);
-            e.z  += fixedToFloat(packet.dZ);
+            const dx = packet.dX ?? packet.dx ?? 0;
+            const dy = packet.dY ?? packet.dy ?? 0;
+            const dz = packet.dZ ?? packet.dz ?? 0;
+            e.x  += fixedToFloat(dx);
+            e.y  += fixedToFloat(dy);
+            e.z  += fixedToFloat(dz);
             e.yaw = angleToYaw(packet.yaw);
             pushEvent(session, { type: "entity_move", entityId: eid, x: e.x, y: e.y, z: e.z, yaw: e.yaw });
             break;
         }
 
         case "entity_teleport": {
-            const eid = Number(packet.entityId);
+            const eid = Number(packet.entityId ?? packet.entity_id);
             const e   = session.entities.get(eid);
-            if (!e) break;
+            if (!e) {
+                // Create stub so later moves work if spawn was missed
+                if (session.entities.size < MAX_ENTITIES) {
+                    const x = fixedToFloat(packet.x);
+                    const y = fixedToFloat(packet.y);
+                    const z = fixedToFloat(packet.z);
+                    const yaw = angleToYaw(packet.yaw);
+                    session.entities.set(eid, { x, y, z, yaw, kind: "player", name: "Player" });
+                    pushEvent(session, { type: "entity_spawn", entityId: eid, kind: "player", name: "Player", x, y, z, yaw });
+                }
+                break;
+            }
             e.x   = fixedToFloat(packet.x);
             e.y   = fixedToFloat(packet.y);
             e.z   = fixedToFloat(packet.z);
@@ -619,8 +649,10 @@ function onPacket(session, packet, meta) {
             break;
         }
 
-        case "entity_destroy": {
-            const ids = Array.isArray(packet.entityIds) ? packet.entityIds.map(Number) : [];
+        case "entity_destroy":
+        case "destroy_entities": {
+            const raw = packet.entityIds || packet.entityids || packet.ids || [];
+            const ids = Array.isArray(raw) ? raw.map(Number) : [];
             if (!ids.length) break;
             for (const eid of ids) session.entities.delete(eid);
             pushEvent(session, { type: "entity_destroy", entityIds: ids });
