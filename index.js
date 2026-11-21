@@ -33,8 +33,97 @@ function chatPacketToText(packet) {
     catch { return raw; }
 }
 
+// Resolve Minecraft Java SRV records explicitly. minecraft-protocol only performs
+// its built-in SRV lookup when port === 25565; Aternos addresses often include a
+// non-default port in the UI, which otherwise bypasses the SRV target entirely.
+function isAternosHost(host) {
+    return /(?:^|\.)aternos\.(?:me|org)$/i.test(String(host || "").replace(/\.$/, ""));
+}
+
+function statusError(error) {
+    const message = String(error?.message || error || "Unknown error");
+    const code = String(error?.code || (message.match(/\b(ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|EHOSTUNREACH)\b/)?.[1]) || "PING_FAILED");
+    return { code, message: message.slice(0, 220) };
+}
+
+async function pingCandidates(host, port) {
+    const candidates = [];
+    const seen = new Set();
+    const add = (targetHost, targetPort, route) => {
+        const key = `${String(targetHost).toLowerCase()}:${targetPort}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            candidates.push({ host: targetHost, port: targetPort, route });
+        }
+    };
+
+    // Aternos Java's normal address is SRV-backed. Also honor SRV for any
+    // hostname using the standard Java port. For an explicit Aternos port,
+    // try SRV first (current assignment), then the supplied host:port as backup.
+    const shouldResolveSrv = net.isIP(host) === 0 && (port === 25565 || isAternosHost(host));
+    if (shouldResolveSrv) {
+        try {
+            const records = await dns.resolveSrv(`_minecraft._tcp.${host.replace(/\.$/, "")}`);
+            const ordered = [...records].sort((a, b) => a.priority - b.priority || b.weight - a.weight);
+            for (const record of ordered.slice(0, 2)) {
+                const targetHost = String(record.name || "").replace(/\.$/, "");
+                const targetPort = Number(record.port);
+                if (!targetHost || !Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) continue;
+                const validation = validateTarget(targetHost, targetPort);
+                if (validation) continue;
+                const dnsError = await publicDnsError(targetHost);
+                if (dnsError) {
+                    console.warn(`[PING SRV SKIP] ${host} -> ${targetHost}:${targetPort}: ${dnsError}`);
+                    continue;
+                }
+                add(targetHost, targetPort, "srv");
+            }
+        } catch (error) {
+            // No SRV record is normal for non-Aternos servers; keep direct fallback.
+            if (error?.code !== "ENODATA" && error?.code !== "ENOTFOUND" && error?.code !== "ESERVFAIL") {
+                console.warn(`[PING SRV ERROR] ${host}: ${error?.code || error?.message || error}`);
+            }
+        }
+    }
+
+    // Always preserve the exact address entered by the player as a fallback.
+    add(host, port, "direct");
+    return candidates;
+}
+
 async function pingServer(host, port) {
-    return mc.ping({ host, port, version: "1.8.8", closeTimeout: 15000, noPongTimeout: 5000 });
+    const candidates = await pingCandidates(host, port);
+    const failures = [];
+
+    for (const candidate of candidates) {
+        try {
+            // Supplying connect() prevents minecraft-protocol from doing a second,
+            // implicit SRV lookup and guarantees TCP reaches the candidate above.
+            const result = await mc.ping({
+                host: candidate.host,
+                port: candidate.port,
+                version: "1.8.8",
+                closeTimeout: 7500,
+                noPongTimeout: 2500,
+                connect: (client) => {
+                    client.setSocket(net.connect({ host: candidate.host, port: candidate.port }));
+                }
+            });
+            result.jtnRoute = candidate.route;
+            result.jtnTarget = `${candidate.host}:${candidate.port}`;
+            return result;
+        } catch (error) {
+            const detail = statusError(error);
+            failures.push({ ...candidate, ...detail });
+            console.warn(`[PING ATTEMPT FAILED] ${candidate.route} ${candidate.host}:${candidate.port} ${detail.code}: ${detail.message}`);
+        }
+    }
+
+    const last = failures[failures.length - 1] || { code: "PING_FAILED", message: "No se recibió respuesta" };
+    const combined = new Error(failures.map(item => `${item.route} ${item.host}:${item.port} ${item.code}`).join("; ").slice(0, 500));
+    combined.code = last.code;
+    combined.attempts = failures;
+    throw combined;
 }
 
 function faviconToHex(favicon, size = 32) {
@@ -138,17 +227,35 @@ app.get("/ping", async (req, res) => {
     if (dnsError) return res.status(400).json({ error: dnsError });
     try {
         const result = await pingServer(host, port);
+        let pixels = null;
+        if (result.favicon) {
+            try { pixels = faviconToHex(result.favicon, 32); }
+            catch (faviconError) { console.warn("[PING FAVICON ERROR]", host, faviconError.message); }
+        }
+        console.log(`[PING OK] ${host}:${port} via ${result.jtnRoute || "direct"} (${result.jtnTarget || `${host}:${port}`})`);
         res.json({
+            ok: true,
+            status: "online",
             motd: chatComponentToText(result.description),
             online: result.players?.online ?? 0,
             max: result.players?.max ?? 0,
             version: result.version?.name ?? "?",
             favicon: result.favicon ?? null,
-            latency: result.latency ?? 0
+            pixels,
+            latency: result.latency ?? 0,
+            route: result.jtnRoute || "direct",
+            target: result.jtnTarget || `${host}:${port}`
         });
     } catch (error) {
-        console.error("[PING ERROR]", host, error.message);
-        res.status(502).json({ error: "offline" });
+        const detail = statusError(error);
+        console.error(`[PING ERROR] ${host}:${port} ${detail.code}: ${detail.message}`);
+        res.status(502).json({
+            ok: false,
+            status: "unreachable",
+            error: detail.message || "No se pudo consultar el servidor",
+            errorCode: detail.code,
+            attempts: Array.isArray(error?.attempts) ? error.attempts : []
+        });
     }
 });
 
