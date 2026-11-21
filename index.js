@@ -912,6 +912,11 @@ app.post("/bridge/send", (req, res) => {
                 session.client.write("arm_animation", {});
                 session.lastSendAt = now;
                 break;
+            case "respawn":
+                // 1.8.8 client_command payload 0 = "perform respawn"
+                session.client.write("client_command", { payload: 0 });
+                session.lastSendAt = now;
+                break;
             default:
                 return res.status(400).json({ ok: false, error: "Acción no permitida" });
         }
