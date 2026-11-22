@@ -67,7 +67,10 @@ async function publicDnsError(host) {
         if (!records.length || records.some(r => isPrivateAddress(r.address)))
             return "el dominio no apunta exclusivamente a direcciones públicas";
         return null;
-    } catch { return "no se pudo resolver el dominio"; }
+    } catch (e) {
+        if (e?.code === "EAI_AGAIN" || e?.code === "ESERVFAIL") return null;
+        return "no se pudo resolver el dominio";
+    }
 }
 
 function validateTarget(host, port) {
