@@ -343,14 +343,12 @@ function makeChunkPayload(session, x, z, bitMap, chunkData, groundUp, skyLightSe
     if (!Number.isInteger(cx) || !Number.isInteger(cz)) throw new Error("Coordenadas inválidas");
     if (!Buffer.isBuffer(chunkData)) chunkData = Buffer.from(chunkData || []);
 
-    const sectionCount = popcount16(mask);
-    // Minecraft 1.8.x serializes each section as one contiguous record:
-    // Blocks (8192), BlockLight (2048), then SkyLight (2048 in dimensions
-    // with sky). The old decoder incorrectly treated these as three global
-    // arrays, so section 1+ read lighting bytes as block IDs after respawn.
-    const sectionBytes = 8192 + 2048 + (skyLightSent ? 2048 : 0);
-    const biomeOffset = sectionCount * sectionBytes;
-    const required = biomeOffset + (groundUp ? 256 : 0);
+    const sectionCount    = popcount16(mask);
+    const blockBytes      = sectionCount * 8192;
+    const blockLightBytes = sectionCount * 2048;
+    const skyLightBytes   = skyLightSent ? sectionCount * 2048 : 0;
+    const biomeOffset     = blockBytes + blockLightBytes + skyLightBytes;
+    const required        = biomeOffset + (groundUp ? 256 : 0);
     if (chunkData.length < required)
         throw new Error(`Chunk truncado: ${chunkData.length} < ${required}`);
 
@@ -367,25 +365,19 @@ function makeChunkPayload(session, x, z, bitMap, chunkData, groundUp, skyLightSe
     }
 
     const sections = [];
-    let offset = 0;
+    let ordinal = 0;
     for (let sy = 0; sy < 16; sy++) {
         if ((mask & (1 << sy)) === 0) continue;
-
-        const bStart = offset;
-        offset += 8192;
-        const blStart = offset;
-        offset += 2048;
-        const slStart = skyLightSent ? offset : null;
-        if (skyLightSent) offset += 2048;
-
+        const bStart  = ordinal * 8192;
+        const blStart = blockBytes + ordinal * 2048;
+        const slStart = blockBytes + blockLightBytes + ordinal * 2048;
         sections.push({
             y: sy,
-            blocksBase64: chunkData.subarray(bStart, bStart + 8192).toString("base64"),
+            blocksBase64:     chunkData.subarray(bStart,  bStart  + 8192).toString("base64"),
             blockLightBase64: chunkData.subarray(blStart, blStart + 2048).toString("base64"),
-            skyLightBase64: skyLightSent
-                ? chunkData.subarray(slStart, slStart + 2048).toString("base64")
-                : null
+            skyLightBase64:   skyLightSent ? chunkData.subarray(slStart, slStart + 2048).toString("base64") : null
         });
+        ordinal++;
     }
 
     return {
