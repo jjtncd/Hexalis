@@ -33,6 +33,41 @@ function chatPacketToText(packet) {
     catch { return raw; }
 }
 
+function stripColorCodes(text) {
+    return String(text || "").replace(/§[0-9a-fk-or]/gi, "").trim();
+}
+
+function extractChatActions(component) {
+    const actions = [];
+    const seen = new Set();
+    function walk(c) {
+        if (!c) return;
+        if (Array.isArray(c)) { c.forEach(walk); return; }
+        if (typeof c !== "object") return;
+        if (c.clickEvent && c.clickEvent.action === "run_command") {
+            const label = stripColorCodes(chatComponentToText(c));
+            const command = String(c.clickEvent.value || "").trim();
+            const key = `${label}|${command}`;
+            if (label && command && !seen.has(key)) {
+                seen.add(key);
+                actions.push({ label, command });
+            }
+        }
+        if (Array.isArray(c.extra)) c.extra.forEach(walk);
+        if (Array.isArray(c.with))  c.with.forEach(walk);
+    }
+    walk(component);
+    return actions;
+}
+
+function parseChatRaw(packet) {
+    const raw = packet && packet.message;
+    if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch {}
+    }
+    return raw || null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Network / DNS helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -533,9 +568,11 @@ function onPacket(session, packet, meta) {
         }
 
         case "chat": {
-            const text = chatPacketToText(packet).slice(0, 500);
+            const raw   = parseChatRaw(packet);
+            const text  = stripColorCodes(chatPacketToText(packet)).slice(0, 500);
+            const actions = extractChatActions(raw);
             if (isVerificationNotice(text)) markVerificationRequired(session, "server_chat");
-            else pushEvent(session, { type: "chat", text });
+            else pushEvent(session, { type: "chat", text, actions });
             break;
         }
 
@@ -686,6 +723,33 @@ function onPacket(session, packet, meta) {
             if (!ids.length) break;
             for (const eid of ids) session.entities.delete(eid);
             pushEvent(session, { type: "entity_destroy", entityIds: ids });
+            break;
+        }
+
+        case "custom_payload": {
+            const channel = String(packet.channel || "");
+            if (channel === "BungeeCord") {
+                try {
+                    const buf = Buffer.isBuffer(packet.data) ? packet.data : Buffer.from(packet.data || []);
+                    // BungeeCord sub-channel is a UTF8 string prefixed by a 2-byte big-endian length
+                    if (buf.length >= 2) {
+                        const subLen = buf.readUInt16BE(0);
+                        const sub    = buf.subarray(2, 2 + subLen).toString("utf8");
+                        if (sub === "Connect" && buf.length > 2 + subLen + 2) {
+                            const srvLen  = buf.readUInt16BE(2 + subLen);
+                            const srvName = buf.subarray(2 + subLen + 2, 2 + subLen + 2 + srvLen).toString("utf8");
+                            pushEvent(session, { type: "server_transfer", server: srvName, channel });
+                            console.log(`[BRIDGE] BungeeCord Connect -> ${srvName} (${session.username})`);
+                        } else {
+                            pushEvent(session, { type: "plugin_message", channel, sub });
+                        }
+                    }
+                } catch (e) {
+                    pushEvent(session, { type: "plugin_message", channel });
+                }
+            } else {
+                pushEvent(session, { type: "plugin_message", channel });
+            }
             break;
         }
 
@@ -1051,6 +1115,33 @@ app.post("/bridge/chat", (req, res) => {
         session.client.chat(text);
         session.lastChatAt = now; session.lastActivity = now; session.sendCount++;
         return res.json({ ok: true, action: "chat", sendCount: session.sendCount });
+    } catch (error) {
+        return res.status(502).json({ ok: false, error: String(error?.message || error).slice(0, 300) });
+    }
+});
+
+// Dedicated endpoint for commands (/login, /register, /hub, etc.)
+// and for clicking chat actions sent by the server ([Yes], [No], etc.)
+app.post("/bridge/command", (req, res) => {
+    if (!requireBridgeKey(req, res)) return;
+    const session = getSession(req.body?.sessionId);
+    if (!session || session.closed || !session.client)
+        return res.status(404).json({ ok: false, error: "Sesión no activa" });
+    if (!session.joined)
+        return res.status(409).json({ ok: false, error: "Todavía no entraste al mundo" });
+    let text = String(req.body?.text || "").trim();
+    if (!text) return res.status(400).json({ ok: false, error: "Texto vacío" });
+    // ensure commands start with /
+    if (!text.startsWith("/")) text = "/" + text;
+    if (text.length > 200)
+        return res.status(400).json({ ok: false, error: "Comando muy largo (máx 200)" });
+    const now = Date.now();
+    if (now - session.lastChatAt < 300)
+        return res.status(429).json({ ok: false, throttled: true, error: "Acciones muy rápidas" });
+    try {
+        session.client.chat(text);
+        session.lastChatAt = now; session.lastActivity = now; session.sendCount++;
+        return res.json({ ok: true, action: "command", text, sendCount: session.sendCount });
     } catch (error) {
         return res.status(502).json({ ok: false, error: String(error?.message || error).slice(0, 300) });
     }
