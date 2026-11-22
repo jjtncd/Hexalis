@@ -465,6 +465,7 @@ function onPacket(session, packet, meta) {
             };
             session.playerX = pos.x; session.playerY = pos.y; session.playerZ = pos.z;
             session.positionSeen = true;
+            session.awaitingSpawnPosition = false;
             if (session.loginPacketSeen) markSessionJoined(session, "initial position");
 
             if (session.client && !session.closed) {
@@ -539,27 +540,31 @@ function onPacket(session, packet, meta) {
             const foodVal = Number.isFinite(food) ? food : 0;
             const satVal = Number.isFinite(sat) ? sat : 0;
             const wasDead = session.dead === true;
-            session.dead = health <= 0;
+            // A positive health packet alone must not unlock a player who has died.
+            // In 1.8.8, the clientbound Respawn packet is the authoritative transition.
+            if (!wasDead && health <= 0) session.dead = true;
             session.lastHealth = health;
             session.lastFood = foodVal;
-            // Always push health; death is critical and must not be coalesced away
+            // Always push health; the transition revision preserves death/respawn ordering.
+            if (session.dead !== wasDead) session.healthRevision = (session.healthRevision || 0) + 1;
             pushEvent(session, {
                 type: "health",
                 health,
                 food: foodVal,
                 saturation: satVal,
-                dead: health <= 0,
+                dead: session.dead === true,
+                revision: session.healthRevision || 0,
             });
             if (session.dead && !wasDead) {
-                console.log(`[HEALTH] DEATH ${session.username} hp=${health}`);
+                console.log(`[HEALTH] DEATH ${session.username} hp=${health} rev=${session.healthRevision}`);
                 pushEvent(session, {
                     type: "death",
                     health: 0,
                     food: foodVal,
                     saturation: satVal,
+                    dead: true,
+                    revision: session.healthRevision || 0,
                 });
-            } else if (!session.dead && wasDead) {
-                console.log(`[HEALTH] ALIVE ${session.username} hp=${health}`);
             }
             break;
         }
@@ -568,11 +573,29 @@ function onPacket(session, packet, meta) {
             session.dimension = Number(packet.dimension) || 0;
             session.gameMode  = Number(packet.gamemode)  || 0;
             session.positionSeen = false;
+            session.awaitingSpawnPosition = true;
             session.chunkKeys.clear();
             session.entities.clear();
-            pushEvent(session, { type: "respawn",
-                dimension: session.dimension, gameMode: session.gameMode,
-                levelType: String(packet.levelType || "") });
+            // A long-poll queue may still contain pre-death coordinates/chunks.
+            // Drop them so they cannot be mistaken for the new spawn handoff.
+            const staleWorldEvents = new Set([
+                "position", "spawn_position", "chunk_data", "chunk_unload",
+                "block_change", "entity_spawn", "entity_move", "entity_destroy",
+            ]);
+            session.queue = session.queue.filter(ev => !staleWorldEvents.has(ev.type));
+            session.dead = false; // Only the server's respawn packet releases the death lock.
+            session.lastRespawnAt = 0;
+            session.healthRevision = (session.healthRevision || 0) + 1;
+            pushEvent(session, {
+                type: "respawn",
+                dimension: session.dimension,
+                gameMode: session.gameMode,
+                levelType: String(packet.levelType || ""),
+                health: session.lastHealth > 0 ? session.lastHealth : 20,
+                dead: false,
+                respawned: true,
+                revision: session.healthRevision,
+            });
             break;
 
         // ── ENTITIES ──────────────────────────────────────────────────────────
@@ -694,7 +717,8 @@ function getSession(id) {
 function startKeepAlive(session) {
     if (session._keepAlive) return;
     session._keepAlive = setInterval(() => {
-        if (session.closed || !session.client || !session.joined) return;
+        if (session.closed || !session.client || !session.joined
+            || session.dead === true || session.awaitingSpawnPosition === true) return;
         const now = Date.now();
         if (now - session.lastSendAt > 8000) {
             try {
@@ -738,12 +762,15 @@ app.post("/bridge/connect", async (req, res) => {
         entities: new Map(),           // ← entity tracking
         dimension: 0, gameMode: 0,
         positionSeen: false,
+        awaitingSpawnPosition: false,
         playerX: 0, playerY: 64, playerZ: 0,
         loginPacketSeen: false,
         joined: false,
         dead: false,
         lastHealth: 20,
         lastFood: 20,
+        healthRevision: 0,
+        lastRespawnAt: 0,
         verificationRequired: false, verificationSource: null,
         closed: false,
         createdAt: Date.now(), lastActivity: Date.now(),
@@ -895,6 +922,25 @@ app.post("/bridge/send", (req, res) => {
     const action  = String(req.body?.action || "");
     const payload = req.body?.payload && typeof req.body.payload === "object" ? req.body.payload : req.body;
     const now     = Date.now();
+
+    // Do not accept client movement while the Java server reports zero health.
+    // Chat and the respawn request remain available from the death screen.
+    const movementActions = new Set(["position", "look", "position_look", "ground", "swing"]);
+    if ((session.dead || session.awaitingSpawnPosition) && movementActions.has(action)) {
+        return res.status(409).json({
+            ok: false,
+            dead: session.dead === true,
+            awaitingSpawn: session.awaitingSpawnPosition === true,
+            error: "Movimiento bloqueado hasta que el servidor confirme el nuevo spawn.",
+        });
+    }
+    if (action === "respawn") {
+        if (now - (session.lastRespawnAt || 0) < 1000) {
+            return res.status(429).json({ ok: false, throttled: true, error: "Respawn ya solicitado; esperando al servidor." });
+        }
+        session.lastRespawnAt = now;
+    }
+
     const minGap  = action === "chat" ? 500 : 25;
     const prev    = action === "chat" ? session.lastChatAt : session.lastSendAt;
     if (now - prev < minGap)
@@ -965,7 +1011,12 @@ app.post("/bridge/send", (req, res) => {
         }
         session.lastActivity = now;
         session.sendCount++;
-        return res.json({ ok: true, action, sendCount: session.sendCount });
+        return res.json({
+            ok: true,
+            action,
+            sendCount: session.sendCount,
+            ...(action === "respawn" ? { pending: true, serverConfirmed: false } : {}),
+        });
     } catch (error) {
         const message = String(error?.message || error).slice(0, 300);
         session.error = message;
