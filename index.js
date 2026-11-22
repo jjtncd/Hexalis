@@ -145,22 +145,29 @@ async function pingServer(host, port) {
     const failures = [];
 
     for (const candidate of candidates) {
-        try {
-            const result = await mc.ping({
-                host: candidate.host,
-                port: candidate.port,
-                version: "1.8.8",
-                closeTimeout: 10000,
-                noPongTimeout: 4000,
-            });
-            result.jtnRoute  = candidate.route;
-            result.jtnTarget = `${candidate.host}:${candidate.port}`;
-            console.log(`[PING OK] ${host}:${port} via ${candidate.route} -> ${candidate.host}:${candidate.port}`);
-            return result;
-        } catch (error) {
-            const detail = statusError(error);
-            failures.push({ ...candidate, ...detail });
-            console.warn(`[PING FAIL] ${candidate.route} ${candidate.host}:${candidate.port} ${detail.code}`);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const result = await mc.ping({
+                    host: candidate.host,
+                    port: candidate.port,
+                    version: "1.8.8",
+                    closeTimeout: 12000,
+                    noPongTimeout: 8000,
+                });
+                result.jtnRoute  = candidate.route;
+                result.jtnTarget = `${candidate.host}:${candidate.port}`;
+                console.log(`[PING OK] ${host}:${port} via ${candidate.route} -> ${candidate.host}:${candidate.port}`);
+                return result;
+            } catch (error) {
+                const detail = statusError(error);
+                if (attempt === 0 && (detail.code === "ETIMEDOUT" || detail.code === "PING_FAILED")) {
+                    console.warn(`[PING RETRY] ${candidate.route} ${candidate.host}:${candidate.port}`);
+                    await new Promise(r => setTimeout(r, 1500));
+                    continue;
+                }
+                failures.push({ ...candidate, ...detail });
+                console.warn(`[PING FAIL] ${candidate.route} ${candidate.host}:${candidate.port} ${detail.code}`);
+            }
         }
     }
 
